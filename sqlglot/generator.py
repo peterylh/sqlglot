@@ -210,6 +210,7 @@ class Generator(metaclass=_Generator):
         exp.ToTableProperty: lambda self, e: f"TO {self.sql(e.this)}",
         exp.TransformModelProperty: lambda self, e: self.func("TRANSFORM", *e.expressions),
         exp.TransientProperty: lambda *_: "TRANSIENT",
+        exp.TruncatePartition: lambda self, e: self.truncatepartition_sql(e),
         exp.Union: lambda self, e: self.set_operations(e),
         exp.UnloggedProperty: lambda *_: "UNLOGGED",
         exp.UsingTemplateProperty: lambda self, e: f"USING TEMPLATE {self.sql(e, 'this')}",
@@ -4196,6 +4197,16 @@ class Generator(metaclass=_Generator):
             return self.sql(this)
 
         return self.sql(exp.cast(this, exp.DataType.Type.TIMESTAMP, dialect=self.dialect))
+
+    def truncatepartition_sql(self, expression: exp.TruncatePartition) -> str:
+        """Default implementation for TRUNCATE PARTITION."""
+        if expression.expressions:
+            partitions = self.expressions(expression, flat=True)
+            return f"TRUNCATE PARTITION ({partitions})"
+        elif expression.expression:
+            return f"TRUNCATE PARTITION {self.sql(expression, 'expression')}"
+        else:
+            return "TRUNCATE PARTITION"
 
     def tsordstodatetime_sql(self, expression: exp.TsOrDsToDatetime) -> str:
         this = expression.this

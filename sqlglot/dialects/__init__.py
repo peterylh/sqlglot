@@ -76,6 +76,7 @@ DIALECTS = [
     "DuckDB",
     "Dune",
     "Fabric",
+    "Greenplum",
     "Hive",
     "Materialize",
     "MySQL",

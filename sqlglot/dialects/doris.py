@@ -690,3 +690,183 @@ class Doris(MySQL):
             if expression.find_ancestor(exp.Update, exp.Delete):
                 return super().table_sql(expression, sep=" ")
             return super().table_sql(expression, sep=sep)
+
+        def _extract_literal_value(self, expression):
+            """Extract literal value from CAST expressions or return the expression as-is.
+
+            Doris doesn't support CAST in partition definitions, so we need to extract
+            the literal value from CAST expressions.
+            """
+            if isinstance(expression, exp.Cast):
+                # Extract the literal value from CAST
+                return expression.this
+            return expression
+
+        def _clean_partition_name(self, expr):
+            """Extract and clean partition name from expression.
+
+            This method handles both CAST and Literal expressions and returns
+            a cleaned partition name suitable for Doris.
+            """
+            # First extract the literal value from CAST if needed
+            literal_expr = self._extract_literal_value(expr)
+
+            if isinstance(literal_expr, exp.Literal):
+                clean_name = literal_expr.this.replace("-", "")
+                return f"p{clean_name}"
+
+            # Fallback: use the full expression
+            expr_sql = self.sql(expr)
+            clean_name = (
+                expr_sql.replace("'", "")
+                .replace('"', "")
+                .replace("-", "")
+                .replace(":", "")
+                .replace("_", "")
+            )
+            return f"p{clean_name}"
+
+        def addpartition_sql(self, expression: exp.AddPartition) -> str:
+            """Convert Greenplum ADD PARTITION with START/END to Doris VALUES syntax.
+
+            Doris only supports two specific cases:
+            1. START INCLUSIVE END EXCLUSIVE -> Doris left-closed, right-open interval [start, end)
+            2. END EXCLUSIVE (no START) -> Doris VALUES LESS THAN
+
+            All other combinations will raise an error.
+            """
+            exists_sql = " IF NOT EXISTS" if expression.args.get("exists") else ""
+            partition_name = self.sql(expression, "this")
+
+            # Check if we have START/END range specification
+            has_start = expression.args.get("start") is not None
+            has_end = expression.args.get("end") is not None
+            start_inclusive = expression.args.get("start_inclusive")
+            end_inclusive = expression.args.get("end_inclusive")
+
+            if has_start and has_end:
+                # Case 1: START INCLUSIVE END EXCLUSIVE -> Doris left-closed, right-open interval
+                if start_inclusive is True and end_inclusive is False:
+                    # Convert to Doris VALUES [start, end) syntax
+                    # Extract literal values from CAST expressions
+                    start_expr = self._extract_literal_value(expression.args.get("start"))
+                    end_expr = self._extract_literal_value(expression.args.get("end"))
+                    start_value = self.sql(start_expr)
+                    end_value = self.sql(end_expr)
+                    return f"ADD PARTITION{exists_sql} {partition_name} VALUES [({start_value}), ({end_value}))"
+                else:
+                    # All other START/END combinations are not supported
+                    start_type = "INCLUSIVE" if start_inclusive else "EXCLUSIVE"
+                    end_type = "INCLUSIVE" if end_inclusive else "EXCLUSIVE"
+                    raise ValueError(
+                        f"Doris partition conversion error: Unsupported START/END combination. "
+                        f"Got START {start_type} END {end_type} in partition '{partition_name}'. "
+                        f"Only 'START INCLUSIVE END EXCLUSIVE' is supported for range partitions."
+                    )
+
+            elif has_end and not has_start:
+                # Case 2: Only END EXCLUSIVE -> Doris VALUES LESS THAN
+                if end_inclusive is False:
+                    # Extract literal value from CAST expression
+                    end_expr = self._extract_literal_value(expression.args.get("end"))
+                    end_value = self.sql(end_expr)
+                    return (
+                        f"ADD PARTITION{exists_sql} {partition_name} VALUES LESS THAN ({end_value})"
+                    )
+                else:
+                    raise ValueError(
+                        f"Doris partition conversion error: Unsupported END type. "
+                        f"Got END INCLUSIVE in partition '{partition_name}'. "
+                        f"Only 'END EXCLUSIVE' is supported when START is not specified."
+                    )
+
+            elif has_start and not has_end:
+                # Only START specified - not supported in Doris conversion
+                start_type = "INCLUSIVE" if start_inclusive else "EXCLUSIVE"
+                raise ValueError(
+                    f"Doris partition conversion error: Unsupported partition specification. "
+                    f"Got START {start_type} without END in partition '{partition_name}'. "
+                    f"Doris requires either 'START INCLUSIVE END EXCLUSIVE' or 'END EXCLUSIVE' only."
+                )
+
+            else:
+                # No range specified, use basic syntax (this should work for simple partitions)
+                return f"ADD PARTITION{exists_sql} {partition_name}"
+
+        def droppartition_sql(self, expression: exp.DropPartition) -> str:
+            """Generate SQL for DROP PARTITION in Doris."""
+            exists_sql = " IF EXISTS" if expression.args.get("exists") else ""
+
+            if expression.args.get("for_clause"):
+                # Convert Greenplum FOR syntax to standard partition name
+                if expression.expressions:
+                    expr = expression.expressions[0]
+                    partition_name = self._clean_partition_name(expr)
+                    return f"DROP PARTITION{exists_sql} {partition_name}"
+                else:
+                    return f"DROP PARTITION{exists_sql}"
+            else:
+                # Standard syntax
+                expressions_sql = self.expressions(expression)
+                return f"DROP PARTITION{exists_sql} {expressions_sql}"
+
+        def alter_sql(self, expression: exp.Alter) -> str:
+            """Override ALTER SQL generation to handle TruncatePartition specially.
+
+            In Doris, TRUNCATE PARTITION should generate a standalone TRUNCATE TABLE statement
+            instead of being part of an ALTER TABLE statement.
+            """
+            actions = expression.args["actions"]
+
+            # Special handling for TruncatePartition - generate standalone TRUNCATE TABLE
+            if len(actions) == 1 and isinstance(actions[0], exp.TruncatePartition):
+                truncate_action = actions[0]
+                table_name = self.sql(expression.this)
+
+                if truncate_action.args.get("for_clause"):
+                    # Convert Greenplum FOR syntax to Doris TRUNCATE TABLE syntax
+                    expr = truncate_action.args.get("expression")
+                    if expr:
+                        partition_name = self._clean_partition_name(expr)
+                        return f"TRUNCATE TABLE {table_name} PARTITION({partition_name})"
+                    else:
+                        return f"TRUNCATE TABLE {table_name}"
+                else:
+                    # Standard syntax with partition names
+                    if truncate_action.expressions:
+                        expressions_sql = self.expressions(truncate_action, flat=True)
+                        return f"TRUNCATE TABLE {table_name} PARTITION({expressions_sql})"
+                    else:
+                        return f"TRUNCATE TABLE {table_name}"
+
+            # For all other ALTER statements, use the default behavior
+            return super().alter_sql(expression)
+
+        def truncatepartition_sql(self, expression: exp.TruncatePartition) -> str:
+            """Generate SQL for TRUNCATE PARTITION in Doris.
+
+            This method should not be called directly when TruncatePartition is part of an ALTER statement,
+            as alter_sql() handles it specially. This is kept for compatibility.
+            """
+            # Get the table name from the parent ALTER statement
+            parent = expression.parent
+            table_name = "unknown_table"  # fallback
+
+            if parent and hasattr(parent, "this") and parent.this:
+                table_name = self.sql(parent.this)
+
+            if expression.args.get("for_clause"):
+                # Convert Greenplum FOR syntax to Doris TRUNCATE TABLE syntax
+                expr = expression.args.get("expression")
+                if expr:
+                    partition_name = self._clean_partition_name(expr)
+                    return f"TRUNCATE TABLE {table_name} PARTITION({partition_name})"
+                else:
+                    return f"TRUNCATE TABLE {table_name}"
+            else:
+                # Standard syntax with partition names
+                if expression.expressions:
+                    expressions_sql = self.expressions(expression, flat=True)
+                    return f"TRUNCATE TABLE {table_name} PARTITION({expressions_sql})"
+                else:
+                    return f"TRUNCATE TABLE {table_name}"

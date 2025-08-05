@@ -4946,7 +4946,16 @@ class AddConstraint(Expression):
 
 
 class AddPartition(Expression):
-    arg_types = {"this": True, "exists": False, "location": False}
+    arg_types = {
+        "this": True,
+        "exists": False,
+        "location": False,
+        "start": False,
+        "start_inclusive": False,
+        "end": False,
+        "end_inclusive": False,
+        "properties": False,
+    }
 
 
 class AttachOption(Expression):
@@ -4954,12 +4963,16 @@ class AttachOption(Expression):
 
 
 class DropPartition(Expression):
-    arg_types = {"expressions": True, "exists": False}
+    arg_types = {"expressions": True, "exists": False, "for_clause": False}
 
 
 # https://clickhouse.com/docs/en/sql-reference/statements/alter/partition#replace-partition
 class ReplacePartition(Expression):
     arg_types = {"expression": True, "source": True}
+
+
+class TruncatePartition(Expression):
+    arg_types = {"expressions": False, "expression": False, "for_clause": False}
 
 
 # Binary expressions like (ADD a b)

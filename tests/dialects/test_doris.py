@@ -1,4 +1,5 @@
 from tests.dialects.test_dialect import Validator
+import sqlglot
 
 
 class TestDoris(Validator):
@@ -137,15 +138,84 @@ class TestDoris(Validator):
             "CREATE TABLE test_table (c1 INT, c2 DATE) PARTITION BY RANGE (`c2`) (FROM ('2000-11-14') TO ('2021-11-14') INTERVAL 2 YEAR)"
         )
 
-    def test_postgres_to_doris_table_alias_conversion(self):
-        """Test conversion from postgres to Doris for DELETE/UPDATE statements with table aliases."""
+    def test_greenplum_to_doris_altertable(self):
+        """Test conversion from Greenplum SQL to Doris SQL using direct SQL comparison."""
+
+        # Test cases: input Greenplum SQL -> expected Doris SQL
+        test_cases = [
+            (
+                "ALTER TABLE sales DROP PARTITION FOR (DATE'2023-01-01')",
+                "ALTER TABLE sales DROP PARTITION p20230101",
+            ),
+            (
+                "ALTER TABLE sales TRUNCATE PARTITION FOR (DATE'2023-01-01')",
+                "TRUNCATE TABLE sales PARTITION(p20230101)",
+            ),
+            (
+                "ALTER TABLE sales DROP PARTITION IF EXISTS FOR (DATE'2023-01-01')",
+                "ALTER TABLE sales DROP PARTITION IF EXISTS p20230101",
+            ),
+            (
+                "ALTER TABLE sales ADD PARTITION p1 START (DATE'2023-01-01') INCLUSIVE END (DATE'2023-02-01') EXCLUSIVE",
+                "ALTER TABLE sales ADD PARTITION p1 VALUES [('2023-01-01'), ('2023-02-01'))",
+            ),
+            (
+                "ALTER TABLE sales ADD PARTITION p2 START (DATE'2023-01-01') INCLUSIVE END (DATE'2023-02-01') EXCLUSIVE WITH (tablespace='ts1')",
+                "ALTER TABLE sales ADD PARTITION p2 VALUES [('2023-01-01'), ('2023-02-01'))",
+            ),
+            (
+                "ALTER TABLE sales ADD PARTITION IF NOT EXISTS p3 START (DATE'2023-01-01') INCLUSIVE END (DATE'2023-02-01') EXCLUSIVE",
+                "ALTER TABLE sales ADD PARTITION IF NOT EXISTS p3 VALUES [('2023-01-01'), ('2023-02-01'))",
+            ),
+            (
+                "ALTER TABLE sales ADD PARTITION p4 END (DATE'2023-02-01') EXCLUSIVE",
+                "ALTER TABLE sales ADD PARTITION p4 VALUES LESS THAN ('2023-02-01')",
+            ),
+        ]
+
+        for greenplum_sql, expected_doris_sql in test_cases:
+            with self.subTest(greenplum_sql=greenplum_sql):
+                # Parse Greenplum SQL and convert to Doris
+                parsed = sqlglot.parse(greenplum_sql, dialect="greenplum")[0]
+                actual_doris_sql = parsed.sql(
+                    dialect="doris", unsupported_level=sqlglot.ErrorLevel.IGNORE
+                )
+
+                # Compare with expected Doris SQL
+                self.assertEqual(actual_doris_sql, expected_doris_sql)
+
+    def test_greenplum_to_doris_altertable_unsupported_cases(self):
+        """Test that unsupported Greenplum partition syntax raises errors when converting to Doris."""
+        unsupported_cases = [
+            "ALTER TABLE sales ADD PARTITION p2 START (DATE'2023-02-01') INCLUSIVE END (DATE'2023-03-01') INCLUSIVE",
+            "ALTER TABLE sales ADD PARTITION p3 START (DATE'2023-03-01') EXCLUSIVE END (DATE'2023-04-01') EXCLUSIVE",
+            "ALTER TABLE sales ADD PARTITION p4 START (DATE'2023-04-01') EXCLUSIVE END (DATE'2023-05-01') INCLUSIVE",
+            "ALTER TABLE sales ADD PARTITION p5 START (DATE'2023-05-01') INCLUSIVE",
+            "ALTER TABLE sales ADD PARTITION p7 START (DATE'2023-07-01') EXCLUSIVE",
+            "ALTER TABLE sales ADD PARTITION p8 END (DATE'2023-08-01') INCLUSIVE",
+        ]
+
+        for sql in unsupported_cases:
+            with self.subTest(sql=sql):
+                # Parse with Greenplum dialect
+                parsed = sqlglot.parse(sql, dialect="greenplum")[0]
+
+                # We expect conversion to Doris to raise an exception
+                with self.assertRaises(Exception) as context:
+                    parsed.sql(dialect="doris")
+
+                # Verify it's the expected Doris conversion error
+                self.assertIn("Doris partition conversion error", str(context.exception))
+
+    def test_greenplum_to_doris_table_alias_conversion(self):
+        """Test conversion from Greenplum to Doris for DELETE/UPDATE statements with table aliases."""
 
         # Test cases for DELETE statements with table aliases
         self.validate_all(
             "DELETE FROM sales AS s WHERE s.id = 1",
             write={
                 "doris": "DELETE FROM sales s WHERE s.id = 1",
-                "postgres": "DELETE FROM sales AS s WHERE s.id = 1",
+                "greenplum": "DELETE FROM sales AS s WHERE s.id = 1",
             },
         )
 
@@ -154,7 +224,7 @@ class TestDoris(Validator):
             "DELETE FROM orders AS o WHERE o.customer_id IN (SELECT c.id FROM customers AS c WHERE c.status = 'inactive')",
             write={
                 "doris": "DELETE FROM orders o WHERE o.customer_id IN (SELECT c.id FROM customers c WHERE c.`status` = 'inactive')",
-                "postgres": "DELETE FROM orders AS o WHERE o.customer_id IN (SELECT c.id FROM customers AS c WHERE c.status = 'inactive')",
+                "greenplum": "DELETE FROM orders AS o WHERE o.customer_id IN (SELECT c.id FROM customers AS c WHERE c.status = 'inactive')",
             },
         )
 
@@ -163,7 +233,7 @@ class TestDoris(Validator):
             "DELETE FROM temp_data AS t WHERE NOT EXISTS (SELECT 1 FROM main_data AS m WHERE m.id = t.id)",
             write={
                 "doris": "DELETE FROM temp_data t WHERE NOT EXISTS(SELECT 1 FROM main_data m WHERE m.id = t.id)",
-                "postgres": "DELETE FROM temp_data AS t WHERE NOT EXISTS(SELECT 1 FROM main_data AS m WHERE m.id = t.id)",
+                "greenplum": "DELETE FROM temp_data AS t WHERE NOT EXISTS(SELECT 1 FROM main_data AS m WHERE m.id = t.id)",
             },
         )
 
@@ -172,7 +242,7 @@ class TestDoris(Validator):
             "UPDATE employees AS e SET e.salary = e.salary * 1.1 WHERE e.department = 'IT'",
             write={
                 "doris": "UPDATE employees e SET e.salary = e.salary * 1.1 WHERE e.department = 'IT'",
-                "postgres": "UPDATE employees AS e SET e.salary = e.salary * 1.1 WHERE e.department = 'IT'",
+                "greenplum": "UPDATE employees AS e SET e.salary = e.salary * 1.1 WHERE e.department = 'IT'",
             },
         )
 
@@ -181,7 +251,7 @@ class TestDoris(Validator):
             "UPDATE inventory AS i SET i.quantity = 0 WHERE i.product_id IN (SELECT p.id FROM products AS p WHERE p.discontinued = true)",
             write={
                 "doris": "UPDATE inventory i SET i.quantity = 0 WHERE i.product_id IN (SELECT p.id FROM products p WHERE p.discontinued = TRUE)",
-                "postgres": "UPDATE inventory AS i SET i.quantity = 0 WHERE i.product_id IN (SELECT p.id FROM products AS p WHERE p.discontinued = TRUE)",
+                "greenplum": "UPDATE inventory AS i SET i.quantity = 0 WHERE i.product_id IN (SELECT p.id FROM products AS p WHERE p.discontinued = TRUE)",
             },
         )
 
@@ -190,7 +260,7 @@ class TestDoris(Validator):
             "UPDATE accounts AS a SET a.balance = a.balance + 100, a.status = 'active' WHERE a.account_type = 'savings'",
             write={
                 "doris": "UPDATE accounts a SET a.balance = a.balance + 100, a.`status` = 'active' WHERE a.account_type = 'savings'",
-                "postgres": "UPDATE accounts AS a SET a.balance = a.balance + 100, a.status = 'active' WHERE a.account_type = 'savings'",
+                "greenplum": "UPDATE accounts AS a SET a.balance = a.balance + 100, a.status = 'active' WHERE a.account_type = 'savings'",
             },
         )
 
@@ -199,7 +269,7 @@ class TestDoris(Validator):
             "UPDATE users AS u SET u.status = CASE WHEN u.age >= 18 THEN 'adult' ELSE 'minor' END",
             write={
                 "doris": "UPDATE users u SET u.`status` = CASE WHEN u.age >= 18 THEN 'adult' ELSE 'minor' END",
-                "postgres": "UPDATE users AS u SET u.status = CASE WHEN u.age >= 18 THEN 'adult' ELSE 'minor' END",
+                "greenplum": "UPDATE users AS u SET u.status = CASE WHEN u.age >= 18 THEN 'adult' ELSE 'minor' END",
             },
         )
 
@@ -208,7 +278,7 @@ class TestDoris(Validator):
             "UPDATE prices AS p SET p.amount = p.amount * 0.9 WHERE p.product_id IN (SELECT pr.id FROM products AS pr JOIN categories AS c ON pr.category_id = c.id WHERE c.name = 'Electronics')",
             write={
                 "doris": "UPDATE prices p SET p.amount = p.amount * 0.9 WHERE p.product_id IN (SELECT pr.id FROM products pr JOIN categories c ON pr.category_id = c.id WHERE c.`name` = 'Electronics')",
-                "postgres": "UPDATE prices AS p SET p.amount = p.amount * 0.9 WHERE p.product_id IN (SELECT pr.id FROM products AS pr JOIN categories AS c ON pr.category_id = c.id WHERE c.name = 'Electronics')",
+                "greenplum": "UPDATE prices AS p SET p.amount = p.amount * 0.9 WHERE p.product_id IN (SELECT pr.id FROM products AS pr JOIN categories AS c ON pr.category_id = c.id WHERE c.name = 'Electronics')",
             },
         )
 
@@ -217,6 +287,6 @@ class TestDoris(Validator):
             "UPDATE customers AS c SET c.full_name = 'John Doe' WHERE c.full_name IS NULL",
             write={
                 "doris": "UPDATE customers c SET c.full_name = 'John Doe' WHERE c.full_name IS NULL",
-                "postgres": "UPDATE customers AS c SET c.full_name = 'John Doe' WHERE c.full_name IS NULL",
+                "greenplum": "UPDATE customers AS c SET c.full_name = 'John Doe' WHERE c.full_name IS NULL",
             },
         )
